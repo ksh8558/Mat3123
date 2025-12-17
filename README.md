@@ -221,9 +221,9 @@ Autoregressive만으로도 개선은 되었지만,
 결과 MIDI 파일에서도 노트가 생성되어  
 실제로 연주 가능한 기타 리프를 얻을 수 있었다.
 
-또한 이 과정은 단순한 구현상의 수정이 아니라,  
-소규모 데이터 환경에서 생성 모델이 쉽게 붕괴할 수 있다는 점을 확인하고  
-이를 디코딩 단계에서 안정화한 설계 선택으로 볼 수 있다.
+또한 이 과정은 단순히 오류수정이 아  
+소규모 데이터 환경에서 생성 모델이 쉽게 붕괴할 수 있다는 점을 확인할 수 있었고
+이를 디코딩 단계에서 안정화하는 방법또한 알게 되었습니다.
 
 ---
 
@@ -241,6 +241,34 @@ my_riff_project_verseonly/
  ├─ generate.py
  ├─ visualize_tokens.py
  └─ check_midi.py
+
+
+
+실행 방법
+1. 라이브러리 설치
+pip install torch pretty_midi numpy matplotlib
+
+2. 데이터 준비
+midi_riffs/ 폴더에
+Verse 구간 2마디로 잘라낸 기타 MIDI 파일을 넣는다.
+
+3. VAE 학습
+python train_vae.py
+결과: riff_vae.pth
+
+4. Latent Diffusion 학습
+python train_diffusion.py
+결과: latent_diffusion.pth
+
+5. 기타 리프 생성
+python generate.py
+출력: generated_riff_long.mid
+
+6. (선택) 결과 확인
+python check_midi.py
+생성된 MIDI의 노트 개수와 분포를 확인할 수 있다
+
+
 
 
 
