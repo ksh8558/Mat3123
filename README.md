@@ -290,9 +290,19 @@ python train_diffusion.py
 python generate.py
 출력: generated_riff_long.mid
 
+사용방법
 
+# VAE Pretraining
+python pretrain_vae_guitarset.py
 
+# VAE Finetuning
+python finetune_vae_rhcp.py
 
+# Latent Diffusion Training
+python train_diffusion_rhcp.py
+
+# Generate Guitar Riff
+python generate.py
 
 
 
