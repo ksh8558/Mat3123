@@ -260,6 +260,7 @@ my_riff_project_verseonly/
 ├── guitarset_tokens_4bars/     # 실제 학습 토큰 (.npy)
 ├── pretrain_vae_guitarset.py
 ├── finetune_vae_rhcp.py
+├── config.py
 ├── train_diffusion_rhcp.py
 ├── generate.py
 ├── models.py
