@@ -16,26 +16,24 @@ John Frusciante의 연주는 Jimi Hendrix를 연상시키는 화려한 솔로도
 곡의 분위기를 지탱하는 멜로딕한 리프가 가장 큰 매력이다.
 그리고 반복 속에서 미묘하게 변하는 뉘앙스 또한 인상을준다.
 
-이 프로젝트에서 Verse 구간만을 선택한 이유는 
+프로젝트에서 Verse 구간만을 사용한 이유는 크게 두 가지이다.
 
-크게 2가지 이유가있다.
+1.곡 전체 모델링할때 다음과 같은 문제가 있다.
+-시퀀스 길이가 길어져 학습이 불안정해짐
+-많은 양의 데이터가 필요함
+-Verse / Chorus / Bridge 등 구조가 복잡함
 
-1.곡 전체를 모델링하는 경우 
-다음과 같은 문제가 있다.
-- 시퀀스가 길어져 학습이 불안정해짐
-- 많은 데이터가 필요함
-- 구조(Verse / Chorus / Bridge 등)가 복잡함
+학부 수준의 데이터 규모와 모델 복잡도를 고려했을 때,
+곡 전체 생성은 비효율적이라고 판단하였다.
 
 2.VAE의 특성을 생각해보자
- VAE는 개별 샘플을 암기하는 모델이 아니라,  
-데이터 전체가 이루는 분포를 연속적인 latent space로 학습하는 모델이다.  
-따라서 입력 데이터가 반복적이고 구조적으로 유사할수록  
-latent space가 안정적으로 형성된다.
+ VAE는 개별 샘플을 암기하는 모델이 아니라 데이터 전체가 이루는 분포를 연속적인 latent space로 학습하는 모델이다.
+즉 입력 데이터가 반복적이고 구조적으로 유사할수록 latent space가 안정적으로 형성된다.
 
 기타 곡에서 Verse 구간은  
-코드 진행과 리듬 패턴이 반복되며,  
-음의 개수와 변화 폭이 상대적으로 제한되어 있다.  
-이는 VAE가 하나의 일관된 분포로 인식하기에 적합한 특성이다.
+-코드 진행과 리듬 패턴이 반복되며,  
+-음의 개수와 변화 폭이 상대적으로 제한되어 있다.  
+이는 VAE가 하나의 일관된 분포로 인식하기에 적합한 특성임을 알 수 있다.
 
 특히 John Frusciante의 기타 연주에서  
 Verse 파트는 화려한 솔로보다는  
@@ -61,16 +59,13 @@ Verse-only 데이터셋을 구성하였다.
  64분음표 단위는 실제 기타 Verse 연주에서 거의 사용되지 않으며  
  시퀀스 길이만 불필요하게 증가시킨다.
 
- 또한 16분음표 단위로 양자화하면  
- 2마디 Verse 리프를 정확히 64 step의 고정 길이 시퀀스로 표현할 수 있어,  
+ 또한 16분음표 단위 양자화 기준으로 설정했다.
+ 이렇게하면 4마디 Verse 리프를 64 step의 고정 길이 시퀀스로 표현할 수 있어 
  VAE 학습 시 배치 구성과 모델 설계가 단순해지는 장점이 있다.
 
- 따라서 본 프로젝트에서는  
- 리듬 표현력과 모델 학습 안정성 사이의 균형을 고려하여  
- 16분음표 단위를 양자화 기준으로 선택하였다.
 
-3.길이 32 step의 단일 음(monophonic) 시퀀스(2마디를 16분음표=32step)
- Verse 구간의 기타 연주는 복잡한 코드보다는 단일 음 리프나  
+3.길이 64 step의 단일 음(monophonic) 시퀀스(4마디를 16분음표=32step)
+ Verse 구간의 기타 연주는 복잡한 코드보다는 단일한 음의 리프나  
  코드톤을 따라가는 멜로디 형태로 구성되는 경우가 많다.  
  특히 John Frusciante의 Verse 연주는 과도한 화음을 사용하기보다는  
  한 음 한 음의 위치와 뉘앙스를 강조하는 스타일에 가깝다.
@@ -106,12 +101,44 @@ Verse-only 데이터셋을 구성하였다.
 
 ## 모델 구조
 
+초기에는 오로지 John Frusciante의 data만을 사용하여 프로젝트를 진행했지만
+너무 데이터가 부족하여 충분한 성능을 보여주지 못해 본 프로젝트는
+Pretraining → Finetuning → Latent Diffusion → Generation의 단계적 구조로 진행했다.
+
+4.1 왜 Pretraining을 실행했는가
+
+Verse-only RHCP 데이터는 규모가 작고 스타일 편향이 강하다.
+이 상태에서 바로 VAE를 학습할 경우
+-rest 과다 생성
+-음역 붕괴
+-비기타적인 pitch 분포
+같은 문제가 발생할 수 있다.
+
+따라서 본 프로젝트에서는
+VAE가 먼저 “기타라는 악기의 일반적인 연주 문법”을 학습하도록
+GuitarSet 데이터셋을 이용한 사전학습(pretraining) 을 수행하였다.
+
+4.2 Pretraining Dataset: GuitarSet
+
+실제 연주 기반 기타 오디오 데이터
+mono guitar track 사용
+기타 연주 공간(guitar manifold)을 latent space에 형성하기 위해
+
 ### 1. Variational Autoencoder (VAE)
+
+Pretraining 이후,
+VAE를 RHCP Verse-only MIDI 데이터로 finetuning하였다
+
+Finetuning과정
+-Pretrained VAE weight 초기화
+-RHCP Verse 데이터로 추가 학습
+-KL weight 감소
+-epoch 증가
 
 VAE는 기타 리프 시퀀스를 연속적인 latent 벡터로 압축한다.
 
 - Encoder: GRU 기반
-- Latent dimension: 32(당연하게도 32step이니까)
+- Latent dimension: 64(64step이므로)
 - Decoder: GRU 기반
 - Loss:
   - Reconstruction loss (cross entropy)
@@ -126,7 +153,7 @@ VAE는 기타 리프 시퀀스를 연속적인 latent 벡터로 압축한다.
 Diffusion은 MIDI 시퀀스가 아니라  
 **VAE latent space에서 수행**한다.
  MIDI 토큰 시퀀스는 이산(discrete)이고,  
-또한 시간축(32 step) 위에서 리듬/음높이 구조가 얽혀 있다.  
+또한 시간축(64 step) 위에서 리듬/음높이 구조가 얽혀 있다.  
 이 공간에서 바로 diffusion을 수행하려면  
 모델이 매우 복잡해지고 학습 안정성이 떨어질 수 있다.
 
@@ -159,7 +186,7 @@ VAE로 연속 latent 표현을 만든 뒤 그 공간에서 diffusion을 수행�
 ### 3. Autoregressive 디코딩 (rest 붕괴 문제와 해결)
 
 처음에는 diffusion으로 생성한 latent `z`를 VAE decoder에 넣고,  
-한 번에 32 step 전체를 디코딩한 뒤 `argmax`로 토큰을 결정하는 방식으로 구현하였다.
+한 번에 64 step 전체를 디코딩한 뒤 `argmax`로 토큰을 결정하는 방식으로 구현하였다.
 
 하지만 실제로 실행해보니 결과가 대부분 **rest 토큰(0)**으로만 채워지는 현상이 발생했다.  
 즉, 생성된 MIDI가 무음이거나(노트 0개), 거의 연주가 없는 형태로 붕괴되었다.
@@ -173,7 +200,7 @@ decoder가 "가장 안전한 선택"인 rest 토큰으로 확률을 몰아주는
 
 #### 1) Autoregressive decoding (한 step씩 생성)
 
-디코더는 32개의 토큰을 한 번에 결정하는 대신  
+디코더는 64개의 토큰을 한 번에 결정하는 대신  
 이전 step에서 생성한 토큰을 다음 step의 입력으로 사용하여  
 **한 step씩 순차적으로 생성**하도록 변경하였다.
 
@@ -226,18 +253,18 @@ Autoregressive만으로도 개선은 되었지만,
 
 ## 프로젝트 구조
 
-```text
 my_riff_project_verseonly/
- ├─ midi_riffs/              # Verse-only MIDI 데이터
- ├─ config.py
- ├─ midi_utils.py
- ├─ dataset.py
- ├─ models.py
- ├─ train_vae.py
- ├─ train_diffusion.py
- ├─ generate.py
- ├─ visualize_tokens.py
- └─ check_midi.py
+├── annotation/      # GuitarSet jam (VAE pretraining)
+├── guitar_midi/                # 원본 기타 MIDI
+├── midi_riffs/                 # slice + transpose된 MIDI
+├── guitarset_tokens_4bars/     # 실제 학습 토큰 (.npy)
+├── pretrain_vae_guitarset.py
+├── finetune_vae_rhcp.py
+├── train_diffusion_rhcp.py
+├── generate.py
+├── models.py
+├── midi_utils.py
+└── README.md
 
 
 
@@ -247,7 +274,7 @@ pip install torch pretty_midi numpy matplotlib
 
 2. 데이터 준비
 midi_riffs/ 폴더에
-Verse 구간 2마디로 잘라낸 기타 MIDI 파일을 넣는다.
+Verse 구간 4마디로 잘라낸 기타 MIDI 파일을 넣는다.
 
 3. VAE 학습
 python train_vae.py
@@ -261,9 +288,6 @@ python train_diffusion.py
 python generate.py
 출력: generated_riff_long.mid
 
-6. (선택) 결과 확인
-python check_midi.py
-생성된 MIDI의 노트 개수와 분포를 확인할 수 있다
 
 
 
