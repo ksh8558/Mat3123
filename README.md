@@ -279,30 +279,18 @@ midi_riffs/ 폴더에
 Verse 구간 4마디로 잘라낸 기타 MIDI 파일을 넣는다.
 
 3. VAE 학습
-python train_vae.py
-결과: riff_vae.pth
+python pretrain_vae_guitarset.py
+결과: riff_vae_pretrain
 
 4. Latent Diffusion 학습
-python train_diffusion.py
-결과: latent_diffusion.pth
+python finetune_vae_rhcp.py
+결과: latent_diffusion_rhcp.pth
 
 5. 기타 리프 생성
 python generate.py
 출력: generated_riff_long.mid
 
-사용방법
 
-# VAE Pretraining
-python pretrain_vae_guitarset.py
-
-# VAE Finetuning
-python finetune_vae_rhcp.py
-
-# Latent Diffusion Training
-python train_diffusion_rhcp.py
-
-# Generate Guitar Riff
-python generate.py
 
 
 
