@@ -254,7 +254,7 @@ Autoregressive만으로도 개선은 되었지만,
 ## 프로젝트 구조
 
 my_riff_project_verseonly/
-├── annotation/      # GuitarSet jam (VAE pretraining)
+├── audio_mono-pickup_mix/      # GuitarSet wav (VAE pretraining)
 ├── guitar_midi/                # 원본 기타 MIDI
 ├── midi_riffs/                 # slice + transpose된 MIDI
 ├── guitarset_tokens_4bars/     # 실제 학습 토큰 (.npy)
@@ -265,6 +265,7 @@ my_riff_project_verseonly/
 ├── models.py
 ├── midi_utils.py
 └── README.md
+
 
 
 
