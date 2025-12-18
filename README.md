@@ -255,7 +255,7 @@ Autoregressive만으로도 개선은 되었지만,
 
 ```text
 my_riff_project_verseonly/
-├── audio_mono-pickup_mix/      # GuitarSet wav (VAE pretraining)
+├── annotation/      # GuitarSet jam (VAE pretraining)
 ├── guitar_midi/                # 원본 기타 MIDI
 ├── midi_riffs/                 # slice + transpose된 MIDI
 ├── guitarset_tokens_4bars/     # 실제 학습 토큰 (.npy)
