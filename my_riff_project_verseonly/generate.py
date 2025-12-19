@@ -311,7 +311,7 @@ def _mutate_pattern_fru(
     pat: str,
     *,
     p_keep_front=0.85,     # 앞(1~2칸)은 거의 유지
-    p_last_change=0.70,    # 마지막은 자주 바꿈
+    p_last_change=0.75,    # 마지막은 자주 바꿈
     p_swap12=0.10,
     p_add3_last=0.30,
     p_add4_last=0.08,
@@ -560,7 +560,7 @@ def sample_hit_patterns_per_bar(
     section: str,
     motif_repeat_unit: int = 2,    # 2마디 단위로 리듬 motif를 만들고 다음 2마디에서 변주
     variation_prob: float = 0.40,  # repeat 블록에서 셀을 바꿀 확률
-    pickup_prob: float = 0.05,     # 1-hit pickup 확률(연속 금지)
+    pickup_prob: float = 0.00,     # 1-hit pickup 확률(연속 금지)
     start_min_hits: int = 2,       # 시작 2마디 최소 hit 수
 ):
     """
@@ -731,7 +731,7 @@ def sample_latent(ld_trainer, z_dim, T, device):
 
 @torch.no_grad()
 def decode_autoregressive(vae: RiffVAE, z: torch.Tensor, seq_len: int,
-                          temperature=1.0, rest_logit_penalty=2.0) -> np.ndarray:
+                          temperature=1.2, rest_logit_penalty=2.0) -> np.ndarray:
     h = vae.fc_z_to_h(z).unsqueeze(0)
     prev_tok = torch.tensor([[REST_TOKEN]], device=z.device, dtype=torch.long)
 
@@ -804,56 +804,22 @@ def main():
     print("device =", device)
 
     # ---------- structure ----------
-    tempo = 105
+    tempo = 95
     step_div = 2
-    beats_per_bar = 4
+    beats_per_bar = 2
 
-    bars_verse = 8
     bars_chorus = 8
+    repeats = 4                 # 코러스 반복 횟수 (원하면 늘려도 됨)
 
     out_midi = "verse_to_verse2.mid"
 
     steps_per_bar = step_div * beats_per_bar
-    verse_steps = bars_verse * steps_per_bar
     chorus_steps = bars_chorus * steps_per_bar
 
-    # ---------- choose chord progressions ----------
-    chord_prog_verse = sample_progression_mixed("mixolydian_funk", section="verse", transpose=True)
+    # ---------- choose chord progression (chorus only) ----------
     chord_prog_chorus = sample_progression_mixed("major_pop", section="chorus", transpose=True)
     # midi_utils의 parse_chord 호환을 위해 확장코드를 단순화
-    chord_prog_verse = tuple(simplify_chord_for_parser(c) for c in chord_prog_verse)
     chord_prog_chorus = tuple(simplify_chord_for_parser(c) for c in chord_prog_chorus)
-
-    # ---------- hit patterns (state machine per bar) ----------
-    verse_hit_per_bar = sample_hit_patterns_per_bar(bars_verse, section="verse", motif_repeat_unit=2)
-    chorus_hit_per_bar = sample_hit_patterns_per_bar(bars_chorus, section="chorus", motif_repeat_unit=2)
-
-    # (backward-compat) midi_utils가 per_bar를 아직 지원 안 하면, 아래 pool을 사용하도록 남겨둠
-    hit_pool_verse = list({tuple(p) for p in verse_hit_per_bar}) or [("1",)]
-    hit_pool_chorus = list({tuple(p) for p in chorus_hit_per_bar}) or [("1","2","3","4")]
-
-    # ---------- voicing per bar ----------
-    # Verse: 2마디 motif -> 2마디 변주 반복(프루시안테 느낌)
-    verse_voicing = sample_voicing_per_bar(
-        bars_verse,
-        style="core",
-        end_every=4,
-        no_repeat=True,
-        mutate=True,
-        section="verse",
-        motif_repeat_unit=2
-    )
-
-    # Chorus: 좀 더 펑키한 왕복/리듬감, 그래도 2마디 단위 반복은 유지
-    chorus_voicing = sample_voicing_per_bar(
-        bars_chorus,
-        style="funk",
-        end_every=4,
-        no_repeat=True,
-        mutate=True,
-        section="chorus",
-        motif_repeat_unit=2
-    )
 
     # ---------- load models ----------
     vae = RiffVAE(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN, z_dim=32).to(device)
@@ -873,136 +839,138 @@ def main():
     ld_trainer.z_dim = z_dim
     ld_trainer.T = T
 
-    # ---------- token generation per section ----------
-    verse_tokens = build_tokens_for_steps(
-        vae, ld_trainer, verse_steps, device,
-        temperature=1.00, rest_logit_penalty=2.3, max_tries=10
-    )
-    chorus_tokens = build_tokens_for_steps(
-        vae, ld_trainer, chorus_steps, device,
-        temperature=1.1, rest_logit_penalty=2.8, max_tries=10
-    )
+    # ---------- render chorus x repeats ----------
+    import os
 
-    
-# ---------- render verse (intro to avoid "땅-쉼" problem) ----------
-# Verse 초반에 use_token_mask=True면 첫 마디가 REST로 비어 "땅 하고 쉼"처럼 들릴 수 있어서,
-# 앞 1~2마디는 마스크 없이(Intro) 렌더 후 본 Verse와 붙인다.
+    def _repeat_params(r: int, repeats: int):
+        """뒤 반복으로 갈수록 '살짝'만 변주/에너지를 올리는 파라미터."""
+        # 0.0 ~ 1.0
+        t = 0.0 if repeats <= 1 else (r / (repeats - 1))
 
-    intro_bars = min(2, bars_verse)  # 1~2 추천
-    intro_steps = intro_bars * steps_per_bar
-    body_steps = (bars_verse - intro_bars) * steps_per_bar
+        # pickup(1-hit)은 정말 가끔만 + 뒤로 갈수록 아주 조금만 증가
+        pickup_prob = min(0.05, 0.01 + 0.03 * t)  # 0.01~0.04~0.05
 
-    intro_tokens = verse_tokens[:intro_steps] if intro_bars > 0 else None
-    body_tokens = verse_tokens[intro_steps:intro_steps + body_steps] if body_steps > 0 else None
+        # repeat 블록에서 패턴을 바꿀 확률 (뒤로 갈수록 변주 ↑)
+        variation_prob = 0.30 + 0.30 * t          # 0.30 ~ 0.60
 
-    # intro는 무조건 4-hit 위주로(그루브/진입감)
-    intro_drive_pool = [
-        ("1","1&","2&","4"),
-        ("1","2","2&","4"),
-        ("1","2&","3","4"),
-    ]
-    intro_hit_per_bar = [random.choice(intro_drive_pool) for _ in range(intro_bars)]
+        # 토큰 샘플링: 뒤로 갈수록 약간 더 공격적으로
+        temperature = 1.25 + 0.10 * t             # 1.25 ~ 1.35
+        rest_penalty = 2.75 + 0.25 * t            # 2.75 ~ 3.00 (REST 덜 나오게)
 
-    # body는 state machine 결과 사용
-    body_hit_per_bar = verse_hit_per_bar[intro_bars:bars_verse]
+        # 연주 에너지: velocity + money_boost 확률을 뒤로 갈수록 조금 ↑
+        velocity_add = int(round(6 * t))          # 0 ~ 6
+        money_prob = min(0.48, 0.26 + 0.18 * t)    # 0.26 ~ 0.44
 
-    # voicing 길이 mismatch 방지(구버전 midi_utils에서도 안전)
-    intro_voicing = adapt_voicing_per_bar_to_hits(verse_voicing[:intro_bars], intro_hit_per_bar) if intro_bars > 0 else None
-    body_voicing = adapt_voicing_per_bar_to_hits(verse_voicing[intro_bars:bars_verse], body_hit_per_bar) if body_steps > 0 else None
+        # 마지막 반복은 엔딩 감을 좀 더
+        if r == repeats - 1:
+            money_prob = min(0.55, money_prob + 0.08)
+            velocity_add += 2
 
-    intro_mid = "_tmp_intro.mid"
-    body_mid = "_tmp_verse_body.mid"
-    verse_mid = "_tmp_verse.mid"
+        return {
+            "pickup_prob": pickup_prob,
+            "variation_prob": variation_prob,
+            "temperature": temperature,
+            "rest_penalty": rest_penalty,
+            "velocity_add": velocity_add,
+            "money_prob": money_prob,
+        }
 
-    if intro_bars > 0:
+    def _mutate_voicing_for_repeat(voicing_per_bar, r: int, repeats: int):
+        """뒤 반복에서만 '마지막 hit'에 3/4(머니 노트) 확률을 조금 더."""
+        if repeats <= 1 or r == 0:
+            return voicing_per_bar
+
+        t = r / (repeats - 1)
+        p = 0.15 + 0.25 * t  # 0.15 ~ 0.40
+
+        out = []
+        for bi, vp in enumerate(voicing_per_bar):
+            vp = str(vp)
+            # 엔딩 바(4마디 단위 끝)와 마지막 2마디에 변주를 조금 더
+            is_endish = (bi % 4 == 3) or (bi >= len(voicing_per_bar) - 2)
+            if is_endish and random.random() < p and len(vp) >= 1:
+                out.append(vp[:-1] + random.choice(["3", "4"]))
+            else:
+                out.append(vp)
+        return tuple(out)
+
+    tmp_mids = []
+    for r in range(repeats):
+        params = _repeat_params(r, repeats)
+
+        # 리듬: 뒤 반복으로 갈수록 변주 확률/밀도 조금 ↑
+        chorus_hit_per_bar = sample_hit_patterns_per_bar(
+            bars_chorus,
+            section="chorus",
+            motif_repeat_unit=2,
+            variation_prob=float(params["variation_prob"]),
+            pickup_prob=float(params["pickup_prob"]),
+        )
+
+        hit_pool_chorus = list({tuple(p) for p in chorus_hit_per_bar}) or [("1","2","3","4")]
+
+        chorus_voicing = sample_voicing_per_bar(
+            bars_chorus,
+            style="funk",
+            end_every=4,
+            no_repeat=True,
+            mutate=True,
+            section="chorus",
+            motif_repeat_unit=2
+        )
+
+        # 뒤 반복에서만 아주 약하게 money-note 성향을 추가
+        chorus_voicing = _mutate_voicing_for_repeat(chorus_voicing, r, repeats)
+
+        # voicing 길이 mismatch 방지(구버전 midi_utils에서도 안전)
+        chorus_voicing_safe = adapt_voicing_per_bar_to_hits(chorus_voicing, chorus_hit_per_bar)
+
+        # token 생성 (반복마다 새로 뽑아 약간씩 다르게)
+        chorus_tokens = build_tokens_for_steps(
+            vae, ld_trainer, chorus_steps, device,
+            temperature=float(params["temperature"]),
+            rest_logit_penalty=float(params["rest_penalty"]),
+            max_tries=10
+        )
+
+        mid_path = f"_tmp_chorus_{r}.mid"
         render_with_optional_hit_per_bar(
-            intro_tokens, intro_mid,
+            chorus_tokens, mid_path,
             tempo=tempo, step_div=step_div, beats_per_bar=beats_per_bar,
 
-            chord_prog=chord_prog_verse,
-            chord_change_bars=2,
+            chord_prog=chord_prog_chorus,
+            chord_change_bars=1,            # 코러스는 1마디마다 바꿈(진행감↑)
 
-            hit_pattern_pool=hit_pool_verse,
-            hit_pattern_per_bar=intro_hit_per_bar,
-            voicing_per_bar=intro_voicing,
+            hit_pattern_pool=hit_pool_chorus,
+            hit_pattern_per_bar=chorus_hit_per_bar,
+            voicing_per_bar=chorus_voicing_safe,
 
-            use_token_mask=False,           # ★ intro는 마스크 OFF
+            use_token_mask=False,           # 코러스는 빽빽
             ghost_on_rests=True,
             ghost_prob=0.10,
-            ghost_prob_on_hits=0.04,
+            ghost_prob_on_hits=0.03,
 
-            money_boost=False,
+            money_boost=True,
+            money_boost_prob=float(params["money_prob"]),
 
-            velocity=105, vel_rand=10,
-            timing_jitter_ms=6.0,
+            velocity=106 + int(params["velocity_add"]), vel_rand=14,
+            timing_jitter_ms=5.0,
             overlap_ms=78.0,
         )
 
-    if body_steps > 0:
-        render_with_optional_hit_per_bar(
-            body_tokens, body_mid,
-            tempo=tempo, step_div=step_div, beats_per_bar=beats_per_bar,
+        tmp_mids.append(mid_path)
 
-            chord_prog=chord_prog_verse,
-            chord_change_bars=2,            # Verse는 코드 2마디 유지(기타스럽게)
+    # ---------- concatenate all chorus segments ----------
+    if not tmp_mids:
+        raise RuntimeError("No chorus segments were rendered.")
 
-            hit_pattern_pool=hit_pool_verse,
-            hit_pattern_per_bar=body_hit_per_bar,
-            voicing_per_bar=body_voicing,
+    cur = tmp_mids[0]
+    for nxt in tmp_mids[1:]:
+        out_tmp = "_tmp_chorus_concat.mid"
+        concat_two_midis(cur, nxt, out_tmp, tempo=tempo)
+        cur = out_tmp
 
-            use_token_mask=True,            # 본 Verse는 REST로 숨
-            ghost_on_rests=True,
-            ghost_prob=0.22,
-            ghost_prob_on_hits=0.05,
-
-            money_boost=False,
-
-            velocity=90, vel_rand=10,
-            timing_jitter_ms=6.0,
-            overlap_ms=55.0,
-        )
-
-    import os
-    if intro_bars > 0 and body_steps > 0:
-        concat_two_midis(intro_mid, body_mid, verse_mid, tempo=tempo)
-    elif intro_bars > 0:
-        os.replace(intro_mid, verse_mid)
-    else:
-        os.replace(body_mid, verse_mid)
-
-
-
-    # ---------- render chorus ----------
-    # voicing 길이 mismatch 방지(구버전 midi_utils에서도 안전)
-    chorus_voicing_safe = adapt_voicing_per_bar_to_hits(chorus_voicing, chorus_hit_per_bar)
-
-    chorus_mid = "_tmp_verse2.mid"
-    render_with_optional_hit_per_bar(
-        chorus_tokens, chorus_mid,
-        tempo=tempo, step_div=step_div, beats_per_bar=beats_per_bar,
-
-        chord_prog=chord_prog_chorus,
-        chord_change_bars=1,            # Chorus는 1마디마다 바꿈(진행감↑)
-
-        hit_pattern_pool=hit_pool_chorus,
-        hit_pattern_per_bar=chorus_hit_per_bar,
-        voicing_per_bar=chorus_voicing_safe,
-
-        use_token_mask=False,           # Chorus는 빽빽
-        ghost_on_rests=True,
-        ghost_prob=0.10,
-        ghost_prob_on_hits=0.03,
-
-        money_boost=True,
-        money_boost_prob=0.28,
-
-        velocity=106, vel_rand=14,
-        timing_jitter_ms=5.0,
-        overlap_ms=78.0,
-    )
-
-    # ---------- concatenate ----------
-    concat_two_midis(verse_mid, chorus_mid, out_midi, tempo=tempo)
+    os.replace(cur, out_midi)
     print("Saved final MIDI:", out_midi)
 
 
