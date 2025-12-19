@@ -92,6 +92,7 @@ def sample_progression(style: str, transpose=True, transpose_range=(-3, 3)) -> t
 
 # =========================================================
 # 2) Frusciante voicing per bar package (random + mutate)
+#    수정 핵심: "한 마디 안 반복/변주(1114,2231,2233)" + "2마디-2마디 반복 후 변주"
 # =========================================================
 BASE_VOICING = {
     "core": {
@@ -107,62 +108,174 @@ BASE_VOICING = {
         "weights":  {"1111":7,"1121":5,"1211":4,"1112":4},
     }
 }
+
+# 엔딩에 많이 쓰는 "마지막 한 방" (money note)
 ENDING_POOL = ["1113","1213","1123","1114"]
-ENDING_W = {"1113":7,"1213":4,"1123":3,"1114":1}
+ENDING_W = {"1113":7,"1213":4,"1123":3,"1114":2}
 
 def _weighted_pattern(pool, wdict):
     ws = [wdict.get(p, 1) for p in pool]
     return random.choices(pool, weights=ws, k=1)[0]
 
-def _mutate_pattern(pat: str,
-                    p_swap12=0.12,
-                    p_drop2_to1=0.10,
-                    p_add_money_last=0.18,
-                    allow_4=False):
+# --- 추가: 프루시안테스러운 "마디 내부 사이클" 묶음 ---
+# 숫자는 midi_utils 쪽에서 voicing index(또는 변주 레벨)로 쓰인다고 가정.
+# (기존 코드도 1/2/3/4를 쓰고 있으니 호환)
+BAR_MOTIFS = {
+    # verse용: 1114 / 2231 / 2233 류를 자주
+    "verse": [
+        ("1114", 12),
+        ("2231", 10),
+        ("2233", 8),
+        ("1113", 8),
+        ("1123", 6),
+        ("1213", 5),
+        ("1112", 5),
+        ("1121", 4),
+        ("1212", 4),
+        ("2112", 3),
+    ],
+    # chorus용: 펑키하게 왕복/스윙 느낌
+    "chorus": [
+        ("1212", 10),
+        ("2121", 9),
+        ("1221", 7),
+        ("2112", 7),
+        ("1213", 6),
+        ("1123", 5),
+        ("1113", 4),
+        ("1114", 3),
+    ],
+}
+
+def _choose_motif(section: str):
+    items = BAR_MOTIFS.get(section, BAR_MOTIFS["verse"])
+    pats = [p for p, _ in items]
+    ws = [w for _, w in items]
+    return random.choices(pats, weights=ws, k=1)[0]
+
+def _mutate_pattern_fru(
+    pat: str,
+    *,
+    p_keep_front=0.85,     # 앞(1~2칸)은 거의 유지
+    p_last_change=0.70,    # 마지막은 자주 바꿈
+    p_swap12=0.10,
+    p_add3_last=0.30,
+    p_add4_last=0.08,
+):
+    """
+    Frusciante rule-of-thumb:
+    - 같은 느낌 유지(앞부분 유지)
+    - 마지막/후반만 살짝 바꿔서 "같은데 변주" 만들기
+    """
     s = list(pat)
 
-    if random.random() < p_swap12:
-        s = ['2' if c == '1' else ('1' if c == '2' else c) for c in s]
+    # 1) 앞 2칸은 웬만하면 유지, 아니면 1<->2 swap 정도만
+    if random.random() > p_keep_front:
+        if random.random() < p_swap12:
+            for i in range(min(2, len(s))):
+                if s[i] == '1': s[i] = '2'
+                elif s[i] == '2': s[i] = '1'
 
-    if random.random() < p_drop2_to1:
-        idxs = [i for i, c in enumerate(s) if c == '2']
-        if idxs:
-            s[random.choice(idxs)] = '1'
+    # 2) 뒤 2칸은 변주 확률 높게: 1/2를 조금 흔들고, 마지막에 3/4를 꽂기도
+    for i in range(max(2, len(s)-2), len(s)):
+        if random.random() < 0.25:
+            if s[i] == '1': s[i] = '2'
+            elif s[i] == '2': s[i] = '1'
 
-    if random.random() < p_add_money_last:
-        s[-1] = '3'
-
-    if allow_4 and random.random() < 0.03:
-        s[-1] = '4'
+    # 3) 마지막에 money note(3/4) 확률적으로
+    if random.random() < p_last_change:
+        r = random.random()
+        if r < p_add4_last:
+            s[-1] = '4'
+        elif r < (p_add4_last + p_add3_last):
+            s[-1] = '3'
+        # else: keep (혹은 위에서 바뀐 1/2 유지)
 
     return "".join(s)
 
-def sample_voicing_per_bar(n_bars: int, style="core", end_every=4, no_repeat=True, mutate=True):
+def _is_ending_bar(bar_idx: int, end_every: int | None):
+    return (end_every is not None and (bar_idx % end_every) == end_every - 1)
+
+def sample_voicing_per_bar(
+    n_bars: int,
+    style="core",
+    end_every=4,
+    no_repeat=True,
+    mutate=True,
+    section="verse",
+    motif_repeat_unit=2,     # 2마디 단위로 motif를 만들고 다음 2마디에서 변주 반복
+):
+    """
+    기존: 매 마디 독립 샘플링 -> 너무 랜덤
+    수정: 2마디 motif를 만들고, 다음 2마디는 '거의 같은데 마지막만 변주'로 반복(verse 구조)
+    """
     pool = BASE_VOICING[style]["patterns"]
     w = BASE_VOICING[style]["weights"]
 
     out = []
     last = None
-    for bar in range(n_bars):
-        is_ending = (end_every is not None and (bar % end_every) == end_every - 1)
 
-        if is_ending:
-            pat = _weighted_pattern(ENDING_POOL, ENDING_W)
-        else:
-            pat = _weighted_pattern(pool, w)
-            if mutate:
-                pat = _mutate_pattern(pat)
+    # 2마디 motif를 저장해뒀다가, 다음 블록에서 변주 반복
+    last_block = None
 
-        if no_repeat and last is not None:
-            tries = 0
-            while pat == last and tries < 10:
-                pat = _weighted_pattern(pool, w) if not is_ending else _weighted_pattern(ENDING_POOL, ENDING_W)
-                if mutate and not is_ending:
-                    pat = _mutate_pattern(pat)
-                tries += 1
+    bar = 0
+    while bar < n_bars:
+        # 블록 길이(기본 2마디, 남은 마디 수에 따라 조절)
+        block_len = min(motif_repeat_unit, n_bars - bar)
 
-        out.append(pat)
-        last = pat
+        # 1) 블록 생성
+        block = []
+
+        # "repeat block"을 만들 차례인지:
+        # 짝수 블록: 새로 motif 생성
+        # 홀수 블록: 직전 motif를 기반으로 변주
+        block_id = bar // motif_repeat_unit
+        is_repeat_block = (last_block is not None and (block_id % 2 == 1))
+
+        for i in range(block_len):
+            bi = bar + i
+            ending = _is_ending_bar(bi, end_every)
+
+            if ending:
+                pat = _weighted_pattern(ENDING_POOL, ENDING_W)
+            else:
+                if is_repeat_block:
+                    # 직전 block의 i번째를 기반으로 "같은데 변주"
+                    base_pat = last_block[i] if i < len(last_block) else last_block[-1]
+                    pat = _mutate_pattern_fru(base_pat)
+                else:
+                    # 새 motif: (1) 프루시안테 motif를 우선 시도 (2) 부족하면 기존 pool로 fallback
+                    if random.random() < 0.72:
+                        pat = _choose_motif(section)
+                    else:
+                        pat = _weighted_pattern(pool, w)
+
+                    if mutate:
+                        # 너무 망가뜨리지 않게 프루시안테식 변주만
+                        pat = _mutate_pattern_fru(pat)
+
+            # no_repeat: 직전과 완전 동일이면 다시 뽑기(짧게)
+            if no_repeat and last is not None:
+                tries = 0
+                while pat == last and tries < 8:
+                    if ending:
+                        pat = _weighted_pattern(ENDING_POOL, ENDING_W)
+                    else:
+                        pat = _choose_motif(section) if random.random() < 0.75 else _weighted_pattern(pool, w)
+                        if mutate:
+                            pat = _mutate_pattern_fru(pat)
+                    tries += 1
+
+            block.append(pat)
+            last = pat
+
+        out.extend(block)
+
+        # 새 motif 블록이면 저장 (다음 블록에서 repeat 변주에 사용)
+        if not is_repeat_block:
+            last_block = block
+
+        bar += block_len
 
     return tuple(out)
 
@@ -282,10 +395,8 @@ def main():
     chorus_steps = bars_chorus * steps_per_bar
 
     # ---------- choose chord progressions ----------
-    # Verse는 모달/펑키, Chorus는 pop 밝게(혹은 둘 다 funk로 통일해도 됨)
     chord_prog_verse = sample_progression("mixolydian_funk", transpose=True)
     chord_prog_chorus = sample_progression("major_pop", transpose=True)
-
 
     # ---------- hit pattern pools ----------
     hit_pool_verse = [
@@ -302,9 +413,27 @@ def main():
     ]
 
     # ---------- voicing per bar ----------
-    verse_voicing = sample_voicing_per_bar(bars_verse, style="core", end_every=4, no_repeat=True, mutate=True)
-    chorus_voicing = sample_voicing_per_bar(bars_chorus, style="funk", end_every=4, no_repeat=True, mutate=True)
+    # Verse: 2마디 motif -> 2마디 변주 반복(프루시안테 느낌)
+    verse_voicing = sample_voicing_per_bar(
+        bars_verse,
+        style="core",
+        end_every=4,
+        no_repeat=True,
+        mutate=True,
+        section="verse",
+        motif_repeat_unit=2
+    )
 
+    # Chorus: 좀 더 펑키한 왕복/리듬감, 그래도 2마디 단위 반복은 유지
+    chorus_voicing = sample_voicing_per_bar(
+        bars_chorus,
+        style="funk",
+        end_every=4,
+        no_repeat=True,
+        mutate=True,
+        section="chorus",
+        motif_repeat_unit=2
+    )
 
     # ---------- load models ----------
     vae = RiffVAE(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN, z_dim=32).to(device)
@@ -325,14 +454,13 @@ def main():
     ld_trainer.T = T
 
     # ---------- token generation per section ----------
-    # Verse는 숨/공간, Chorus는 빽빽
     verse_tokens = build_tokens_for_steps(
         vae, ld_trainer, verse_steps, device,
         temperature=1.00, rest_logit_penalty=2.3, max_tries=10
     )
     chorus_tokens = build_tokens_for_steps(
         vae, ld_trainer, chorus_steps, device,
-        temperature=1.3, rest_logit_penalty=2.8, max_tries=10
+        temperature=1.1, rest_logit_penalty=2.8, max_tries=10
     )
 
     # ---------- render verse ----------
@@ -356,7 +484,7 @@ def main():
 
         velocity=90, vel_rand=10,
         timing_jitter_ms=6.0,
-        overlap_ms=58.0,
+        overlap_ms=55.0,
     )
 
     # ---------- render chorus ----------
