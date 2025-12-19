@@ -285,7 +285,9 @@ python pretrain_vae_guitarset.py
 
 4. Latent Diffusion 학습
 python finetune_vae_rhcp.py
-결과: latent_diffusion_rhcp.pth
+python pretrain_diffusion.py
+결과: latent_diffusion_rhcp.pth와 latent_diffusion_rhcp.pth
+
 
 5. 기타 리프 생성
 python generate.py
