@@ -291,7 +291,7 @@ python pretrain_diffusion.py
 
 5. 기타 리프 생성
 python generate.py
-출력: generated_riff_long.mid
+출력: verse_to_verse2.mid
 
 
 
