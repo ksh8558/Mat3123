@@ -81,12 +81,166 @@ def transpose_chord(ch: str, semis: int) -> str:
     i = NOTE_ORDER_SHARP.index(root)
     j = (i + semis) % 12
     return NOTE_ORDER_SHARP[j] + ("m" if minor else "")
+# midi_utils.parse_chord()가 확장코드(7, sus4, add9, dim 등)를 지원하지 않으면
+# 렌더 직전에 root + (optional m)만 남겨 단순화한다.
+def simplify_chord_for_parser(ch: str) -> str:
+    ch = ch.strip()
+    if not ch:
+        return ch
+    # root 추출 (A, Bb, C#, etc.)
+    if len(ch) >= 2 and ch[1] in ("#", "b"):
+        root = ch[:2]
+        rest = ch[2:]
+    else:
+        root = ch[:1]
+        rest = ch[1:]
+    # minor 여부만 유지
+    is_minor = rest.startswith("m")
+    root = _norm_root(root)
+    return root + ("m" if is_minor else "")
+
 
 def sample_progression(style: str, transpose=True, transpose_range=(-3, 3)) -> tuple[str, ...]:
     base = _weighted_choice(PROG_PACKS[style])
     if transpose:
         semis = random.randint(transpose_range[0], transpose_range[1])
         base = tuple(transpose_chord(c, semis) for c in base)
+    return base
+
+
+# --- MIDI utils chord parser is often limited to triads (major/minor only).
+#     So we "simplify" extended chords (m7, sus4, add9, dim, etc.) to
+#     plain major/minor roots before rendering.
+def simplify_chord_for_renderer(ch: str) -> str:
+    ch = ch.strip()
+    if not ch:
+        return ch
+    # root extraction
+    if len(ch) >= 2 and ch[1] in ("#", "b"):
+        root, rest = ch[:2], ch[2:]
+    else:
+        root, rest = ch[:1], ch[1:]
+    # minor if any 'm' quality exists at the beginning (m, m7, m9, m7b5 ...)
+    if rest.startswith("m"):
+        return root + "m"
+    # otherwise just major triad root (also collapses sus/add/dim)
+    return root
+
+# =========================================================
+# 1.5) Scale-degree progression generator (Frusciante-ish)
+#      기존 PROG_PACKS 진행을 "안전망"으로 두고,
+#      스케일 기반 진행을 섞어서 harmonic 다양성 ↑
+# =========================================================
+
+def _pc(note: str) -> int:
+    note = _norm_root(note)
+    return NOTE_ORDER_SHARP.index(note)
+
+def _note_from_pc(pc: int) -> str:
+    return NOTE_ORDER_SHARP[pc % 12]
+
+# scale degrees (intervals from tonic)
+SCALE_INTERVALS = {
+    "major":      [0, 2, 4, 5, 7, 9, 11],
+    "mixolydian": [0, 2, 4, 5, 7, 9, 10],
+    "dorian":     [0, 2, 3, 5, 7, 9, 10],
+    "aeolian":    [0, 2, 3, 5, 7, 8, 10],
+}
+
+# degree -> chord flavor pool (간단 버전)
+# (midi_utils 쪽 chord parser가 복잡한 심볼을 못 받으면 여기서 더 단순화하면 됨)
+DEGREE_FLAVOR = {
+    0: ["", "sus2", "sus4", "add9"],
+    1: ["m", "m7"],
+    2: ["m", "sus4"],
+    3: ["", "add9"],
+    4: ["", "sus4"],
+    5: ["m", "m7"],
+    6: ["dim"],
+}
+
+def _parse_chord_root(ch: str) -> str:
+    ch = ch.strip()
+    if len(ch) >= 2 and ch[1] in ("#", "b"):
+        root = ch[:2]
+    else:
+        root = ch[:1]
+    return _norm_root(root)
+
+def _degree_to_chord(tonic: str, scale: str, deg: int) -> str:
+    tonic_pc = _pc(tonic)
+    intervals = SCALE_INTERVALS[scale]
+    root_pc = tonic_pc + intervals[deg % 7]
+    root = _note_from_pc(root_pc)
+
+    flavor_pool = DEGREE_FLAVOR.get(deg % 7, [""])
+    flavor = random.choice(flavor_pool)
+
+    # "dim"은 표기를 'Bdim'처럼
+    if flavor == "dim":
+        return root + "dim"
+    return root + flavor
+
+def sample_progression_scale(
+    tonic: str,
+    scale: str,
+    length: int = 4,
+    step_choices=(-2, -1, 1, 2),
+) -> tuple[str, ...]:
+    # I 또는 V에서 시작하는 느낌(Frus-ish)
+    deg = random.choice([0, 4])
+    degs = [deg]
+    for _ in range(length - 1):
+        deg = (deg + random.choice(step_choices)) % 7
+        degs.append(deg)
+    return tuple(_degree_to_chord(tonic, scale, d) for d in degs)
+
+def sample_progression_mixed(
+    style_pack: str,
+    *,
+    mix_prob: float = 0.55,     # scale 진행으로 "전체 치환" 확률
+    mutate_prob: float = 0.35,  # pack 진행에서 일부만 scale로 바꾸는 확률
+    section: str = "verse",
+    transpose: bool = True,
+) -> tuple[str, ...]:
+    """기존 PROG_PACKS 진행을 유지하면서 스케일 기반 진행을 섞는다."""
+    # 1) 기존 pack 진행 (안전망)
+    base = sample_progression(style_pack, transpose=transpose)
+
+    # 2) 섹션별 추천 스케일
+    if section == "verse":
+        scale = random.choices(
+            ["mixolydian", "dorian", "aeolian"],
+            weights=[6, 4, 2],
+            k=1
+        )[0]
+    else:
+        scale = random.choices(
+            ["major", "mixolydian", "aeolian"],
+            weights=[6, 3, 2],
+            k=1
+        )[0]
+
+    # 3) tonic: base 첫 코드 루트로 통일감
+    tonic = _parse_chord_root(base[0])
+
+    scale_prog = sample_progression_scale(tonic, scale, length=len(base))
+
+    r = random.random()
+    if r < mix_prob:
+        # 전체를 scale 기반으로 교체 (다양성↑)
+        return scale_prog
+
+    if r < (mix_prob + mutate_prob):
+        # 부분 치환 (1~2개만 갈아끼워 "새로운데 안전" 느낌)
+        base = list(base)
+        k = random.choice([1, 2])
+        idxs = random.sample(range(len(base)), k=k)
+        for i in idxs:
+            base[i] = scale_prog[i]
+        return tuple(base)
+
+    # 그대로 사용
     return base
 
 
@@ -280,6 +434,275 @@ def sample_voicing_per_bar(
     return tuple(out)
 
 
+
+# =========================================================
+# 2.5) Rhythm state machine (per-bar hit patterns)
+#    - 리듬을 "패턴 랜덤"이 아니라 "상태 전이"로 움직이게 해서
+#      에너지(밀도/비움/밀어치기)가 마디마다 변하도록 만든다.
+#
+#    * midi_utils.py에 아래처럼 옵션을 추가해야 함:
+#      def token_seq_to_midi_strum_guitar_voicing(..., hit_pattern_pool=None, hit_pattern_per_bar=None, ...):
+#          ...
+#          if hit_pattern_per_bar is not None:
+#              hit_pat = hit_pattern_per_bar[bar_idx]
+#          else:
+#              hit_pat = random.choice(hit_pattern_pool)
+# =========================================================
+
+# =========================================================
+# 2.5) Rhythm state machine (per-bar hit patterns)
+#    - 리듬을 "패턴 랜덤"이 아니라 "상태 전이"로 움직이게 해서
+#      에너지(밀도/비움/밀어치기)가 마디마다 변하도록 만든다.
+#
+#    NOTE:
+#    - "한 번만 치는 마디"가 너무 많으면 처음/끝이 휑해져서 별로임.
+#      그래서 기본은 2~4 hits로 두고, pickup(1 hit)은 아주 가끔만 허용.
+#    - 시작 2마디는 최소 2 hits 보장, 마지막 마디는 drive/push로 밀도 보장.
+# =========================================================
+
+RHYTHM_STATES = ("sparse", "push", "drop", "drive")
+
+RHYTHM_TRANSITION = {
+    # verse: sparse/push 중심 + drop은 "숨" 정도로만
+    "verse": {
+        "sparse": (("sparse", 6), ("push", 4), ("drop", 1)),
+        "push":   (("sparse", 4), ("push", 3), ("drive", 3), ("drop", 1)),
+        "drop":   (("sparse", 6), ("push", 3), ("drive", 1)),
+        "drive":  (("push", 6), ("sparse", 3), ("drop", 1)),
+    },
+    # chorus: drive/push 위주
+    "chorus": {
+        "sparse": (("push", 6), ("drive", 4), ("sparse", 1)),
+        "push":   (("drive", 6), ("push", 3), ("drop", 1)),
+        "drop":   (("push", 6), ("drive", 4), ("sparse", 1)),
+        "drive":  (("drive", 6), ("push", 4), ("drop", 1)),
+    },
+}
+
+# --- pickup(1 hit) 패턴: "진짜 가끔"만 ---
+HIT_PICKUP = [
+    ("4&",),
+    ("4",),
+]
+
+# 상태별 hit pattern 풀
+# - sparse/drop에서도 기본은 2~3 hits로 유지 (숨은 "덜 치기"이지 "한 번만 치기"가 아님)
+HIT_CELLS = {
+    "verse": {
+        "sparse": [
+            ("1","3"),
+            ("1","4"),
+            ("1","2&"),
+            ("1&","3"),
+            ("1&","4"),
+            ("1","3&"),
+        ],
+        "push": [
+            ("1","2&","4"),
+            ("1","1&","3"),
+            ("1&","2&","4"),
+            ("1","3","4"),
+            ("1","2&","3"),
+            ("1","2&","4&"),
+        ],
+        "drop": [
+            # 숨: 2 hits 위주로
+            ("1","4&"),
+            ("1","4"),
+            ("1&","4"),
+            ("1","3"),
+        ],
+        "drive": [
+            ("1","2","3","4"),
+            ("1","1&","2&","4"),
+            ("1","2&","3","4"),
+            ("1","2","2&","4"),
+            ("1","2&","3&","4"),
+        ],
+    },
+    "chorus": {
+        "sparse": [
+            ("1","3"),
+            ("1","4"),
+            ("1","3","4"),
+            ("1","2&","4"),
+        ],
+        "push": [
+            ("1","1&","2&","4"),
+            ("1","2","2&","4"),
+            ("1","1&","2","4"),
+            ("1","2&","3","4"),
+            ("1","2&","4&"),
+        ],
+        "drop": [
+            ("1","4&"),
+            ("1","2&","4"),
+            ("1","3","4"),
+        ],
+        "drive": [
+            ("1","2","3","4"),
+            ("1","2&","3","4"),
+            ("1","1&","2&","3&","4"),
+            ("1","2","2&","3","4"),
+        ],
+    },
+}
+
+def _weighted_next_state(section: str, cur: str) -> str:
+    trans = RHYTHM_TRANSITION[section][cur]
+    states = [s for s,_ in trans]
+    ws = [w for _,w in trans]
+    return random.choices(states, weights=ws, k=1)[0]
+
+def sample_hit_patterns_per_bar(
+    n_bars: int,
+    *,
+    section: str,
+    motif_repeat_unit: int = 2,    # 2마디 단위로 리듬 motif를 만들고 다음 2마디에서 변주
+    variation_prob: float = 0.40,  # repeat 블록에서 셀을 바꿀 확률
+    pickup_prob: float = 0.05,     # 1-hit pickup 확률(연속 금지)
+    start_min_hits: int = 2,       # 시작 2마디 최소 hit 수
+):
+    """
+    반환: 길이 n_bars의 hit pattern list.
+    - 블록 0(2마디): 상태 머신으로 리듬 motif 생성
+    - 블록 1(2마디): 직전 motif 기반으로 약간 변주
+    - ...
+    추가 규칙:
+    - pickup(1 hit)은 매우 낮은 확률로만, 연속 금지, 시작 2마디/마지막 마디 금지
+    - 마지막 마디는 drive/push로 강제 (엔딩 밀도)
+    """
+    sec = "chorus" if section == "chorus" else "verse"
+    cells = HIT_CELLS[sec]
+
+    out = []
+    last_block = None
+    # 시작 state: verse는 sparse, chorus는 push
+    cur_state = "push" if sec == "chorus" else "sparse"
+    last_was_pickup = False
+
+    bar = 0
+    while bar < n_bars:
+        block_len = min(motif_repeat_unit, n_bars - bar)
+        block_id = bar // motif_repeat_unit
+        is_repeat_block = (last_block is not None and (block_id % 2 == 1))
+
+        block = []
+        for i in range(block_len):
+            bar_idx = bar + i
+            is_start_zone = (bar_idx < 2)
+            is_last_bar = (bar_idx == n_bars - 1)
+
+            def choose_pat_for_state(st: str):
+                # 기본 셀에서 선택
+                cand = random.choice(cells[st])
+
+                # 시작 2마디: 최소 hit 수 보장
+                if is_start_zone:
+                    tries = 0
+                    while len(cand) < start_min_hits and tries < 12:
+                        cand = random.choice(cells[st])
+                        tries += 1
+
+                # 마지막 마디: 밀도 보장 (drive/push 우선)
+                if is_last_bar and st in ("sparse", "drop"):
+                    st2 = "drive" if random.random() < 0.65 else "push"
+                    cand2 = random.choice(cells[st2])
+                    return st2, cand2
+
+                return st, cand
+
+            # 1) repeat block이면 이전 motif 기반
+            if is_repeat_block and i < len(last_block):
+                prev_state, prev_pat = last_block[i]
+                if random.random() < variation_prob:
+                    st, pat = choose_pat_for_state(prev_state)
+                else:
+                    st, pat = prev_state, prev_pat
+            else:
+                cur_state = _weighted_next_state(sec, cur_state)
+                st, pat = choose_pat_for_state(cur_state)
+
+            # 2) pickup(1 hit) 아주 가끔: 연속 금지 + 시작/마지막 금지
+            allow_pickup = (not is_start_zone) and (not is_last_bar) and (not last_was_pickup)
+            if allow_pickup and random.random() < pickup_prob:
+                pat = random.choice(HIT_PICKUP)
+                last_was_pickup = True
+            else:
+                last_was_pickup = (len(pat) == 1)
+
+            block.append((st, pat))
+
+        out.extend([pat for _, pat in block])
+
+        if not is_repeat_block:
+            last_block = block
+
+        bar += block_len
+
+    return out
+
+def render_with_optional_hit_per_bar(*args, hit_pattern_pool=None, hit_pattern_per_bar=None, **kwargs):
+    """
+    midi_utils가 hit_pattern_per_bar 인자를 지원하면 per-bar 리듬을 쓰고,
+    지원하지 않으면 기존 hit_pattern_pool 방식으로 fallback.
+    """
+    try:
+        return token_seq_to_midi_strum_guitar_voicing(
+            *args,
+            hit_pattern_pool=hit_pattern_pool,
+            hit_pattern_per_bar=hit_pattern_per_bar,
+            **kwargs
+        )
+    except TypeError:
+        # older midi_utils.py (no hit_pattern_per_bar)
+        return token_seq_to_midi_strum_guitar_voicing(
+            *args,
+            hit_pattern_pool=hit_pattern_pool,
+            **kwargs
+        )
+
+# ---------------------------------------------------------
+# voicing length safety:
+# midi_utils.py가 voicing 길이 == hit 개수를 강제하는 경우가 있어,
+# generate 단계에서 미리 맞춰서(ValueError 방지) 전달한다.
+# ---------------------------------------------------------
+def _fit_voicing_to_hits(vp: str, n_hits: int) -> str:
+    vp = str(vp)
+    if n_hits <= 0:
+        return ""
+    if len(vp) == n_hits:
+        return vp
+    if len(vp) > n_hits:
+        return vp[:n_hits]
+    return vp + (vp[-1] * (n_hits - len(vp)))
+
+def _n_hits_of_pattern(pat) -> int:
+    # pat: tuple[str,...] like ("1","2&","4")
+    try:
+        return len(pat)
+    except Exception:
+        return 0
+
+def adapt_voicing_per_bar_to_hits(voicing_per_bar, hit_pattern_per_bar):
+    if voicing_per_bar is None or hit_pattern_per_bar is None:
+        return voicing_per_bar
+    out = []
+    L = min(len(voicing_per_bar), len(hit_pattern_per_bar))
+    for i in range(L):
+        out.append(_fit_voicing_to_hits(voicing_per_bar[i], _n_hits_of_pattern(hit_pattern_per_bar[i])))
+    # if voicing list longer, keep tail; if shorter, repeat last
+    if len(voicing_per_bar) > L:
+        out.extend(list(voicing_per_bar[L:]))
+    elif len(voicing_per_bar) < len(hit_pattern_per_bar) and len(out) > 0:
+        last = out[-1]
+        for j in range(L, len(hit_pattern_per_bar)):
+            out.append(_fit_voicing_to_hits(last, _n_hits_of_pattern(hit_pattern_per_bar[j])))
+    return tuple(out)
+
+
+
+
 # =========================================================
 # 3) Token generation (LD + VAE)
 # =========================================================
@@ -395,22 +818,19 @@ def main():
     chorus_steps = bars_chorus * steps_per_bar
 
     # ---------- choose chord progressions ----------
-    chord_prog_verse = sample_progression("mixolydian_funk", transpose=True)
-    chord_prog_chorus = sample_progression("major_pop", transpose=True)
+    chord_prog_verse = sample_progression_mixed("mixolydian_funk", section="verse", transpose=True)
+    chord_prog_chorus = sample_progression_mixed("major_pop", section="chorus", transpose=True)
+    # midi_utils의 parse_chord 호환을 위해 확장코드를 단순화
+    chord_prog_verse = tuple(simplify_chord_for_parser(c) for c in chord_prog_verse)
+    chord_prog_chorus = tuple(simplify_chord_for_parser(c) for c in chord_prog_chorus)
 
-    # ---------- hit pattern pools ----------
-    hit_pool_verse = [
-        ("1","1&","2&","4"),
-        ("1","1&","3","4"),
-        ("1","2&","3","4"),
-        ("1","2","2&","4"),
-    ]
-    hit_pool_chorus = [
-        ("1","1&","2&","4"),
-        ("1","2","2&","4"),
-        ("1","1&","2","4"),
-        ("1","2&","3","4"),
-    ]
+    # ---------- hit patterns (state machine per bar) ----------
+    verse_hit_per_bar = sample_hit_patterns_per_bar(bars_verse, section="verse", motif_repeat_unit=2)
+    chorus_hit_per_bar = sample_hit_patterns_per_bar(bars_chorus, section="chorus", motif_repeat_unit=2)
+
+    # (backward-compat) midi_utils가 per_bar를 아직 지원 안 하면, 아래 pool을 사용하도록 남겨둠
+    hit_pool_verse = list({tuple(p) for p in verse_hit_per_bar}) or [("1",)]
+    hit_pool_chorus = list({tuple(p) for p in chorus_hit_per_bar}) or [("1","2","3","4")]
 
     # ---------- voicing per bar ----------
     # Verse: 2마디 motif -> 2마디 변주 반복(프루시안테 느낌)
@@ -463,33 +883,101 @@ def main():
         temperature=1.1, rest_logit_penalty=2.8, max_tries=10
     )
 
-    # ---------- render verse ----------
+    
+# ---------- render verse (intro to avoid "땅-쉼" problem) ----------
+# Verse 초반에 use_token_mask=True면 첫 마디가 REST로 비어 "땅 하고 쉼"처럼 들릴 수 있어서,
+# 앞 1~2마디는 마스크 없이(Intro) 렌더 후 본 Verse와 붙인다.
+
+    intro_bars = min(2, bars_verse)  # 1~2 추천
+    intro_steps = intro_bars * steps_per_bar
+    body_steps = (bars_verse - intro_bars) * steps_per_bar
+
+    intro_tokens = verse_tokens[:intro_steps] if intro_bars > 0 else None
+    body_tokens = verse_tokens[intro_steps:intro_steps + body_steps] if body_steps > 0 else None
+
+    # intro는 무조건 4-hit 위주로(그루브/진입감)
+    intro_drive_pool = [
+        ("1","1&","2&","4"),
+        ("1","2","2&","4"),
+        ("1","2&","3","4"),
+    ]
+    intro_hit_per_bar = [random.choice(intro_drive_pool) for _ in range(intro_bars)]
+
+    # body는 state machine 결과 사용
+    body_hit_per_bar = verse_hit_per_bar[intro_bars:bars_verse]
+
+    # voicing 길이 mismatch 방지(구버전 midi_utils에서도 안전)
+    intro_voicing = adapt_voicing_per_bar_to_hits(verse_voicing[:intro_bars], intro_hit_per_bar) if intro_bars > 0 else None
+    body_voicing = adapt_voicing_per_bar_to_hits(verse_voicing[intro_bars:bars_verse], body_hit_per_bar) if body_steps > 0 else None
+
+    intro_mid = "_tmp_intro.mid"
+    body_mid = "_tmp_verse_body.mid"
     verse_mid = "_tmp_verse.mid"
-    token_seq_to_midi_strum_guitar_voicing(
-        verse_tokens, verse_mid,
-        tempo=tempo, step_div=step_div, beats_per_bar=beats_per_bar,
 
-        chord_prog=chord_prog_verse,
-        chord_change_bars=2,            # Verse는 코드 2마디 유지(기타스럽게)
+    if intro_bars > 0:
+        render_with_optional_hit_per_bar(
+            intro_tokens, intro_mid,
+            tempo=tempo, step_div=step_div, beats_per_bar=beats_per_bar,
 
-        hit_pattern_pool=hit_pool_verse,
-        voicing_per_bar=verse_voicing,
+            chord_prog=chord_prog_verse,
+            chord_change_bars=2,
 
-        use_token_mask=True,            # Verse는 REST로 숨
-        ghost_on_rests=True,
-        ghost_prob=0.22,
-        ghost_prob_on_hits=0.05,
+            hit_pattern_pool=hit_pool_verse,
+            hit_pattern_per_bar=intro_hit_per_bar,
+            voicing_per_bar=intro_voicing,
 
-        money_boost=False,
+            use_token_mask=False,           # ★ intro는 마스크 OFF
+            ghost_on_rests=True,
+            ghost_prob=0.10,
+            ghost_prob_on_hits=0.04,
 
-        velocity=90, vel_rand=10,
-        timing_jitter_ms=6.0,
-        overlap_ms=55.0,
-    )
+            money_boost=False,
+
+            velocity=105, vel_rand=10,
+            timing_jitter_ms=6.0,
+            overlap_ms=78.0,
+        )
+
+    if body_steps > 0:
+        render_with_optional_hit_per_bar(
+            body_tokens, body_mid,
+            tempo=tempo, step_div=step_div, beats_per_bar=beats_per_bar,
+
+            chord_prog=chord_prog_verse,
+            chord_change_bars=2,            # Verse는 코드 2마디 유지(기타스럽게)
+
+            hit_pattern_pool=hit_pool_verse,
+            hit_pattern_per_bar=body_hit_per_bar,
+            voicing_per_bar=body_voicing,
+
+            use_token_mask=True,            # 본 Verse는 REST로 숨
+            ghost_on_rests=True,
+            ghost_prob=0.22,
+            ghost_prob_on_hits=0.05,
+
+            money_boost=False,
+
+            velocity=90, vel_rand=10,
+            timing_jitter_ms=6.0,
+            overlap_ms=55.0,
+        )
+
+    import os
+    if intro_bars > 0 and body_steps > 0:
+        concat_two_midis(intro_mid, body_mid, verse_mid, tempo=tempo)
+    elif intro_bars > 0:
+        os.replace(intro_mid, verse_mid)
+    else:
+        os.replace(body_mid, verse_mid)
+
+
 
     # ---------- render chorus ----------
+    # voicing 길이 mismatch 방지(구버전 midi_utils에서도 안전)
+    chorus_voicing_safe = adapt_voicing_per_bar_to_hits(chorus_voicing, chorus_hit_per_bar)
+
     chorus_mid = "_tmp_verse2.mid"
-    token_seq_to_midi_strum_guitar_voicing(
+    render_with_optional_hit_per_bar(
         chorus_tokens, chorus_mid,
         tempo=tempo, step_div=step_div, beats_per_bar=beats_per_bar,
 
@@ -497,7 +985,8 @@ def main():
         chord_change_bars=1,            # Chorus는 1마디마다 바꿈(진행감↑)
 
         hit_pattern_pool=hit_pool_chorus,
-        voicing_per_bar=chorus_voicing,
+        hit_pattern_per_bar=chorus_hit_per_bar,
+        voicing_per_bar=chorus_voicing_safe,
 
         use_token_mask=False,           # Chorus는 빽빽
         ghost_on_rests=True,

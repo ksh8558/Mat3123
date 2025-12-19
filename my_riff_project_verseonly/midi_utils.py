@@ -98,6 +98,24 @@ def token_seq_to_midi_strum_guitar_voicing(
         tag = tag.strip()
         return (tag.endswith("&") or tag.endswith("e") or tag.endswith("a"))
 
+    def fit_voicing_to_hits(vp: str, n_hits: int) -> str:
+        """
+        voicing 문자열 길이를 hit 개수에 맞춤.
+        - 길면: 마지막 문자를 살리고 앞부분을 자름 (accent 유지)
+        - 짧으면: 마지막 문자를 반복해서 늘림
+        """
+        if n_hits <= 0:
+            return ""
+        vp = str(vp)
+        if len(vp) == n_hits:
+            return vp
+        if len(vp) > n_hits:
+            if n_hits == 1:
+                return vp[-1]
+            return vp[:n_hits-1] + vp[-1]
+        # len(vp) < n_hits
+        return vp + (vp[-1] * (n_hits - len(vp)))
+
     # 기본 hit pattern pool (전부 길이 4로 맞춤)
     if hit_pattern_pool is None:
         hit_pattern_pool = [
@@ -189,8 +207,9 @@ def token_seq_to_midi_strum_guitar_voicing(
         else:
             vp = voicing_cycle[bar % len(voicing_cycle)]
 
+        # voicing 길이가 hit 수와 다르면 자동으로 맞춰서 진행(리듬 다양성 허용)
         if len(vp) != len(hit_steps):
-            raise ValueError(f"voicing '{vp}' length must match hit_pattern length={len(hit_steps)}")
+            vp = fit_voicing_to_hits(vp, len(hit_steps))
 
         for hs, is_up, ch in zip(hit_steps, up_flags, vp):
             step = bar_start_step + hs
