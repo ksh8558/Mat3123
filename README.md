@@ -263,6 +263,8 @@ my_riff_project_verseonly/
 ├── config.py
 ├── train_diffusion_rhcp.py
 ├── generate.py
+├── dataset.py
+├── dataset_tokens.py
 ├── models.py
 ├── midi_utils.py
 └── README.md
