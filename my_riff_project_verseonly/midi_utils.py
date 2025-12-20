@@ -1,290 +1,359 @@
+# MIDI ↔ 토큰 변환 함수들.
 import numpy as np
 import pretty_midi
 
-# REST_TOKEN은 네 config에 맞게 import해도 되고, 여기서 0 가정해도 됨
-# from config import REST_TOKEN
-REST_TOKEN = 0
+from config import PITCH_MIN, PITCH_MAX, REST_TOKEN, BARS, BEATS_PER_BAR, STEPS_PER_BEAT
 
-def token_seq_to_midi_strum_guitar_voicing(
+
+def note_to_token(pitch: int) -> int:
+    if pitch < PITCH_MIN or pitch > PITCH_MAX:
+        return REST_TOKEN
+    return (pitch - PITCH_MIN) + 1
+
+
+def token_to_pitch(token: int):
+    if token == REST_TOKEN:
+        return None
+    return (token - 1) + PITCH_MIN
+
+
+def midi_to_token_seq(
+    midi_path: str,
+    bars: int = BARS,
+    beats_per_bar: int = BEATS_PER_BAR,
+    steps_per_beat: int = STEPS_PER_BEAT,
+    track_idx: int | None = None,
+) -> np.ndarray:
+    pm = pretty_midi.PrettyMIDI(midi_path)
+
+    if track_idx is None:
+        insts = [inst for inst in pm.instruments if not inst.is_drum]
+        if len(insts) == 0:
+            raise ValueError("No non-drum tracks found.")
+        inst = insts[0]
+    else:
+        inst = pm.instruments[track_idx]
+
+    L = bars * beats_per_bar * steps_per_beat
+    tempo = pm.estimate_tempo()
+    sec_per_beat = 60.0 / tempo
+    total_dur = bars * beats_per_bar * sec_per_beat
+
+    times = np.linspace(0, total_dur, num=L, endpoint=False)
+    tokens = np.zeros(L, dtype=np.int64)
+    notes = sorted(inst.notes, key=lambda n: n.start)
+
+    for i, t in enumerate(times):
+        active = [n.pitch for n in notes if (n.start <= t < n.end)]
+        tokens[i] = REST_TOKEN if len(active) == 0 else note_to_token(max(active))
+
+    return tokens
+
+
+def token_seq_to_midi(
     tokens,
     out_path,
-    tempo=100.0,
-    step_div=2,                       # "&" 쓰려면 2 추천
+    tempo=92.0,
+    step_div=4,                # 16분 그리드 추천(4)
+    velocity=86,
+    vel_rand=10,               # 악센트 아님: 사람 손맛(미세 변화)
+    timing_jitter_ms=5.0,      # 사람 손맛
+    overlap_ms=35.0,
     beats_per_bar=4,
+    transpose_semitones=-7,
 
-    chord_prog=("Em", "C", "G", "D"),
-    chord_change_bars=2,
+    # bar 단위 sustain(끊김 방지)
+    rest_grace_bars=1,
 
-    # ===== 랜덤화 옵션 =====
-    hit_pattern=("1","1&","2&","4"),  # 고정 사용
-    hit_pattern_pool=None,            # 마디마다 랜덤 사용(아래 기본 풀 제공)
-    voicing_cycle=("1212","1212","1112","1113"),  # 고정 사용
-    voicing_per_bar=None,             # 마디마다 지정(추천: sample_voicing_per_bar 결과)
+    # ===== Rhythm: 실행마다 1개 랜덤 선택(곡 내 고정) =====
+    strum_pattern_steps=None,
+    rhythm_pool=None,
+    keep_rhythm_fixed=True,
 
-    # ===== 스트로크/고스트 =====
-    use_token_mask=True,              # tokens[step]==REST면 그 hit은 안침(코러스면 False 권장)
-    ghost_on_rests=True,              # REST 위치에서도 고스트 스트럼 가능
-    ghost_prob=0.18,                  # 고스트 발생 확률
-    ghost_prob_on_hits=0.06,          # hit에서도 가끔 고스트를 섞음(더 사람같음)
-    ghost_dur_ms=(45, 85),            # 고스트 길이(짧게)
-    ghost_vel=(18, 40),               # 고스트 세기
+    # ===== Intro 1-bar rhythm variation (bar0만) =====
+    intro_bar_variation=True,
+    intro_force_diff_rhythm=True,
 
-    # ===== 사운드 =====
-    velocity=92,
-    vel_rand=12,
-    overlap_ms=60.0,
-    timing_jitter_ms=6.0,
+    # ===== Voicing cycle =====
+    voicing_pool=None,
+    voicing_keep_fixed_in_song=True,
+    voicing_change_prob_per_bar=0.25,
+    voicing_cycle_seed=None,
 
-    # ===== 코러스 느낌 부스트 =====
-    money_boost=False,                # 코러스에서 sus4 더 자주/더 크게
-    money_boost_prob=0.22,            # (1)->(3)로 승격 확률
+    # ===== NEW: hit마다 chord tones variant 섞기 =====
+    # (악센트 없이도 "한 마디에 같은 음만" 반복되는 문제 해결)
+    voicing_variant_mix=True,
+    triad_bias=0.60,            # triad 비중 (0~1)
+    variant_pool=("dyad", "triad", "add9", "sus2", "sus4"),
+
+    # ===== Hendrix spice (선택) =====
+    hendrix_spice=True,
+    hendrix_prob=0.10,
 ):
+    """
+    ✅ 악센트/ghost/skip 없음 (강세 설계 제거)
+    ✅ 리듬은 실행마다 랜덤 1개 선택, 곡 내 고정
+    ✅ 첫 마디는 리듬만 변주
+    ✅ voicing_cycle(1114/2231/2233 등)로 한 마디 안에서도 '소리' 반복/변주
+    ✅ (NEW) 같은 root라도 hit마다 chord_tones variant를 섞어서
+        "한 마디에 똑같은 음만 계속" 문제를 크게 줄임
+    ✅ '4'는 단순 반복이 아니라 상단 2음 더블스탑으로 처리
+    """
+    tokens = np.array(tokens, dtype=np.int64)
     pm = pretty_midi.PrettyMIDI(initial_tempo=float(tempo))
 
-    inst_clean = pretty_midi.Instrument(
-        program=pretty_midi.instrument_name_to_program("Electric Guitar (clean)")
-    )
-    inst_mute = pretty_midi.Instrument(
-        program=pretty_midi.instrument_name_to_program("Electric Guitar (muted)")
-    )
+    inst = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program("Electric Guitar (clean)"))
+    inst_mute = pretty_midi.Instrument(program=pretty_midi.instrument_name_to_program("Electric Guitar (muted)"))
 
-    tokens = np.array(tokens, dtype=np.int64)
     rng = np.random.default_rng()
+    rng_vc = np.random.default_rng(voicing_cycle_seed if voicing_cycle_seed is not None else rng.integers(0, 2**32 - 1))
 
     step_dur = (60.0 / float(tempo)) / float(step_div)
     steps_per_bar = int(step_div * beats_per_bar)
+    L = len(tokens)
 
-    # ---------------- chord parse ----------------
-    NOTE2PC = {"C":0,"C#":1,"Db":1,"D":2,"D#":3,"Eb":3,"E":4,"F":5,"F#":6,"Gb":6,"G":7,"G#":8,"Ab":8,"A":9,"A#":10,"Bb":10,"B":11}
-    def parse_chord(ch: str):
-        ch = ch.strip()
-        qual = "maj"
-        if ch.endswith("m") and not ch.endswith("maj"):
-            qual = "min"
-            root_name = ch[:-1]
-        else:
-            root_name = ch
-        if root_name not in NOTE2PC:
-            raise ValueError(f"Unsupported chord: {ch}")
-        return NOTE2PC[root_name], qual
-
-    prog = [parse_chord(c) for c in chord_prog]
-
-    # tag -> step (supports "&"; also supports e/a if step_div==4)
-    def beat_to_step(tag: str):
-        tag = tag.strip()
-        # ex: "2&", "3", "1e", "4a"
-        if len(tag) == 1 and tag.isdigit():
-            b = int(tag)
-            return (b - 1) * step_div
-        b = int(tag[0])
-        suf = tag[1:]
-        base = (b - 1) * step_div
-
-        if suf == "&":
-            return base + int(step_div / 2)
-        if step_div >= 4:
-            # 16th grid: e=+1, &=+2, a=+3
-            if suf == "e":
-                return base + 1
-            if suf == "&":
-                return base + 2
-            if suf == "a":
-                return base + 3
-        # fallback
-        return base
-
-    def is_upstroke(tag: str):
-        tag = tag.strip()
-        return (tag.endswith("&") or tag.endswith("e") or tag.endswith("a"))
-
-    def fit_voicing_to_hits(vp: str, n_hits: int) -> str:
-        """
-        voicing 문자열 길이를 hit 개수에 맞춤.
-        - 길면: 마지막 문자를 살리고 앞부분을 자름 (accent 유지)
-        - 짧으면: 마지막 문자를 반복해서 늘림
-        """
-        if n_hits <= 0:
-            return ""
-        vp = str(vp)
-        if len(vp) == n_hits:
-            return vp
-        if len(vp) > n_hits:
-            if n_hits == 1:
-                return vp[-1]
-            return vp[:n_hits-1] + vp[-1]
-        # len(vp) < n_hits
-        return vp + (vp[-1] * (n_hits - len(vp)))
-
-    # 기본 hit pattern pool (전부 길이 4로 맞춤)
-    if hit_pattern_pool is None:
-        hit_pattern_pool = [
-            ("1","1&","2&","4"),   # 기본 펑키
-            ("1","2&","3","4"),    # 띄엄띄엄
-            ("1","1&","3","4"),    # 2를 비워서 공간
-            ("1","2","2&","4"),    # 2에서 몰아치기
-            ("1","1&","2","4"),    # 안정 + 업스트로크
+    # -----------------------------
+    # Rhythm pool (16th grid 기준)
+    # -----------------------------
+    if rhythm_pool is None:
+        rhythm_pool = [
+            (0, 2, 6, 12),          # 1, 1&, 2&, 4
+            (0, 4, 6, 12),          # 1, 2, 2&, 4
+            (0, 2, 8, 12),          # 1, 1&, 3, 4
+            (0, 6, 8, 12),          # 1, 2&, 3, 4
+            (0, 2, 6, 10, 12),      # 1, 1&, 2&, 3&, 4
+            (0, 4, 8, 12),          # 1, 2, 3, 4
+            (0, 2, 4, 6, 12),       # 1, 1&, 2, 2&, 4
+            (0, 3, 6, 11, 12),      # 살짝 펑키
+            (0, 2, 7, 12),          # 1, 1&, 2e, 4
         ]
 
-    # ---------------- voicing ----------------
-    # 1=low power, 2=high power, 3=money(sus4), 4=full(rare)
-    # -12는 절대 안 씀.
-    def choose_root_midi(root_pc, base):
-        best = None
-        for m in range(40, 80):
-            if (m % 12) == root_pc:
-                if best is None or abs(m - base) < abs(best - base):
-                    best = m
-        return best if best is not None else base
+    if strum_pattern_steps is None:
+        main_rhythm = rhythm_pool[rng.integers(0, len(rhythm_pool))]
+    else:
+        main_rhythm = tuple(strum_pattern_steps)
 
-    def voicing_pitches(root_pc, quality, vid: int):
-        if vid == 1:
-            r = choose_root_midi(root_pc, base=52)     # low
-            return [r, r + 7]
-        if vid == 2:
-            r = choose_root_midi(root_pc, base=64)     # high
-            return [r, r + 7]
-        if vid == 3:
-            r = choose_root_midi(root_pc, base=57)     # mid
-            return [r, r + 7, r + 5]
-        if vid == 4:
-            r = choose_root_midi(root_pc, base=52)
-            return [r, r + 7, r + 5]
-        r = choose_root_midi(root_pc, base=52)
-        return [r, r + 7]
+    # intro rhythm (bar0만)
+    intro_pool = [
+        (0, 2, 6, 12),
+        (0, 2, 4, 6, 12),
+        (0, 4, 6, 12),
+        (0, 2, 8, 12),
+        (0, 3, 6, 11, 12),
+        (0, 2, 6, 10, 12),
+    ]
+    if intro_bar_variation:
+        if intro_force_diff_rhythm:
+            cand = [r for r in intro_pool if tuple(r) != tuple(main_rhythm)]
+            intro_rhythm = cand[rng.integers(0, len(cand))] if len(cand) > 0 else main_rhythm
+        else:
+            intro_rhythm = intro_pool[rng.integers(0, len(intro_pool))]
+    else:
+        intro_rhythm = main_rhythm
 
-    # downstroke: low->high, upstroke: high->low
-    def add_strum(inst, pitches, start, end, v, direction="down", strength=1.0):
-        ps = list(pitches)
-        if direction == "up":
-            ps = list(reversed(ps))
+    # -----------------------------
+    # Voicing cycle pool
+    # -----------------------------
+    if voicing_pool is None:
+        voicing_pool = [
+            ("1114", "2231", "2233"),
+            ("1212", "2323", "2312"),
+            ("1123", "2213", "2231"),
+            ("1232", "2321", "2231"),
+            ("1312", "2323", "1212"),
+            ("1112", "2231", "2323"),
+        ]
 
-        t = start
-        for i, p in enumerate(ps):
-            if 0 <= p <= 127:
-                dt = rng.uniform(0.006, 0.016)  # strum delay
-                vv = int(np.clip(v * strength * (0.95 - 0.06*i), 1, 127))
-                inst.notes.append(pretty_midi.Note(
-                    velocity=vv, pitch=int(p), start=float(t), end=float(end)
-                ))
-                t += dt
+    voicing_set = voicing_pool[rng_vc.integers(0, len(voicing_pool))]
+    print("[Rhythm] main =", main_rhythm, "| intro(bar0) =", intro_rhythm, "| fixed_in_song =", keep_rhythm_fixed)
+    print("[Voicing] set =", voicing_set, "| fixed_in_song =", voicing_keep_fixed_in_song)
 
-    # ghost strum = muted, 짧게 긁기
-    def add_ghost(start, direction="down"):
-        dur = rng.uniform(ghost_dur_ms[0], ghost_dur_ms[1]) * 1e-3
+    # ---------- helpers ----------
+    def clamp_to_guitar_range(p: int, lo=48, hi=76) -> int:
+        while p > hi:
+            p -= 12
+        while p < lo:
+            p += 12
+        return int(np.clip(p, 0, 127))
+
+    def add_note(inst_, pitch: int, start: float, end: float, base_vel: int):
+        jitter = rng.uniform(-timing_jitter_ms, timing_jitter_ms) * 1e-3
+        s = max(0.0, start + jitter)
+        e = max(s + 0.02, end + jitter + overlap_ms * 1e-3)
+
+        v = int(base_vel + rng.integers(-vel_rand, vel_rand + 1))
+        v = int(np.clip(v, 30, 112))
+
+        inst_.notes.append(pretty_midi.Note(
+            velocity=v,
+            pitch=int(np.clip(pitch, 0, 127)),
+            start=float(s),
+            end=float(e),
+        ))
+
+    def representative_root_for_bar(bar_tokens: np.ndarray, fallback: int | None) -> int | None:
+        pitches = []
+        for tok in bar_tokens:
+            p = token_to_pitch(int(tok))
+            if p is not None and p > 0:
+                pitches.append(int(p) + int(transpose_semitones))
+        if len(pitches) == 0:
+            return fallback
+        vals, cnts = np.unique(pitches, return_counts=True)
+        return int(vals[np.argmax(cnts)])
+
+    def pick_chord_tones_variant(root_pitch: int, variant: str) -> list[int]:
+        """
+        같은 root라도 variant에 따라 chord_tones 구성을 바꿔서
+        한 마디 안에서도 음이 계속 같지 않게 함.
+        """
+        r = root_pitch
+        is_minor = (rng.random() < 0.35)
+
+        if variant == "dyad":
+            intervals = [0, 7]
+        elif variant == "triad":
+            intervals = [0, (3 if is_minor else 4), 7]
+        elif variant == "add9":
+            intervals = [0, 7, 14]
+        elif variant == "sus2":
+            intervals = [0, 2, 7]
+        elif variant == "sus4":
+            intervals = [0, 5, 7]
+        else:
+            intervals = [0, 7]
+
+        tones = [clamp_to_guitar_range(r + iv) for iv in intervals]
+        tones = sorted(set(tones))
+        if len(tones) > 3:
+            tones = tones[:3]
+        return tones
+
+    def apply_voicing_pattern(chord_tones: list[int], pattern: str) -> list[int]:
+        """
+        pattern 예: "1114"
+        - 1,2,3: 해당 인덱스(클램프)
+        - 4: 상단 2음 더블스탑(tones[-2], tones[-1])로 처리
+        """
+        n = len(chord_tones)
+        if n <= 0:
+            return []
+
+        out = []
+        for ch in pattern:
+            if ch == "4":
+                if n >= 2:
+                    out.extend([chord_tones[-2], chord_tones[-1]])
+                else:
+                    out.append(chord_tones[-1])
+                continue
+
+            if ch < "1" or ch > "9":
+                continue
+            k = int(ch)
+            idx = min(max(k - 1, 0), n - 1)
+            out.append(chord_tones[idx])
+
+        return out
+
+    def add_hendrix_spice(base_root: int, bar_start_step: int):
+        if not hendrix_spice:
+            return
+        if rng.random() >= hendrix_prob:
+            return
+
+        cand = [int(steps_per_bar * 0.45), int(steps_per_bar * 0.85)]
+        hit_step = bar_start_step + cand[rng.integers(0, len(cand))]
+
+        start = hit_step * step_dur
+        dur = rng.uniform(0.045, 0.085)
         end = start + dur
-        v = rng.integers(ghost_vel[0], ghost_vel[1] + 1)
 
-        # muted는 너무 화음처럼 들리면 안 돼서 1~2음만 (root/fifth 느낌)
-        # 여기선 "E3(52) 근처" 같은 고정 보다는 현재 코드 기반으로 넣어줌 (아래에서 호출 시 인자로 pitches 줄 수도 있지만 간단히)
-        # 일단 무난하게 '짧게 두 음'만:
-        # (실제로는 inst_mute program이 muted 톤이라 충분히 기타 느낌 남)
-        return end, int(v)
+        r = clamp_to_guitar_range(base_root, lo=48, hi=76)
 
-    # ---------------- main loop ----------------
-    n_steps = len(tokens)
-    n_bars = int(np.ceil(n_steps / steps_per_bar))
+        if rng.random() < 0.55:
+            intervals = [4, 9]   # 3rd + 6th
+        else:
+            intervals = [3, 10]  # b3 + b7
+
+        p1 = clamp_to_guitar_range(r + intervals[0], lo=52, hi=84)
+        p2 = clamp_to_guitar_range(r + intervals[1], lo=52, hi=84)
+
+        base_v = int(np.clip(velocity * 0.62, 30, 95))
+        add_note(inst_mute, p1, start, end, base_v)
+        add_note(inst_mute, p2, start + 0.012, end, int(base_v * 0.92))
+
+    # -----------------------------
+    # bar loop (마디 단위 코드 체인지)
+    # -----------------------------
+    n_bars = (L + steps_per_bar - 1) // steps_per_bar
+    prev_root = None
+    empty_bar_run = 0
+
+    variants = list(variant_pool)
 
     for bar in range(n_bars):
-        bar_start_step = bar * steps_per_bar
+        bar_start = bar * steps_per_bar
+        bar_end = min(L, bar_start + steps_per_bar)
+        bar_tokens = tokens[bar_start:bar_end]
 
-        # chord select
-        prog_idx = (bar // int(chord_change_bars)) % len(prog)
-        root_pc, quality = prog[prog_idx]
+        root = representative_root_for_bar(bar_tokens, prev_root)
 
-        # pattern select (bar마다 랜덤)
-        if hit_pattern_pool is not None:
-            pat = hit_pattern_pool[rng.integers(0, len(hit_pattern_pool))]
+        if np.all(bar_tokens == REST_TOKEN):
+            empty_bar_run += 1
+            if prev_root is None or empty_bar_run > rest_grace_bars:
+                continue
+            root = prev_root
         else:
-            pat = hit_pattern
+            empty_bar_run = 0
 
-        hit_steps = [beat_to_step(x) for x in pat]
-        up_flags = [is_upstroke(x) for x in pat]
+        if root is None:
+            continue
 
-        # voicing select (bar마다)
-        if voicing_per_bar is not None:
-            vp = voicing_per_bar[bar % len(voicing_per_bar)]
-        else:
-            vp = voicing_cycle[bar % len(voicing_cycle)]
+        prev_root = root
+        root = clamp_to_guitar_range(root)
 
-        # voicing 길이가 hit 수와 다르면 자동으로 맞춰서 진행(리듬 다양성 허용)
-        if len(vp) != len(hit_steps):
-            vp = fit_voicing_to_hits(vp, len(hit_steps))
+        # (bar마다 voicing_set을 바꿀지 옵션)
+        if not voicing_keep_fixed_in_song and (rng_vc.random() < voicing_change_prob_per_bar):
+            voicing_set = voicing_pool[rng_vc.integers(0, len(voicing_pool))]
 
-        for hs, is_up, ch in zip(hit_steps, up_flags, vp):
-            step = bar_start_step + hs
-            if step >= n_steps:
+        cur_rhythm = intro_rhythm if (intro_bar_variation and bar == 0) else main_rhythm
+
+        for i_hit, off in enumerate(cur_rhythm):
+            hit_step = bar_start + off
+            if hit_step >= bar_end:
                 continue
 
-            hit_is_rest = (tokens[step] == REST_TOKEN)
+            t0 = hit_step * step_dur
 
-            # 고스트를 hit에서도 섞고, rest에서도 섞음(옵션)
-            do_ghost = False
-            if hit_is_rest and ghost_on_rests and rng.random() < ghost_prob:
-                do_ghost = True
-            if (not hit_is_rest) and rng.random() < ghost_prob_on_hits:
-                do_ghost = True
-
-            # 리듬 마스크(REST면 안 치기) — 단, 고스트는 가능
-            if use_token_mask and hit_is_rest and (not do_ghost):
-                continue
-
-            start = step * step_dur
-            # timing jitter
-            jitter = rng.uniform(-timing_jitter_ms, timing_jitter_ms) * 1e-3
-            start = max(0.0, start + jitter)
-
-            if do_ghost:
-                end, gv = add_ghost(start, direction=("up" if is_up else "down"))
-                # 현재 코드 기반의 "짧은 뮤트" 1~2음
-                r = choose_root_midi(root_pc, base=56)
-                pitches = [r, r+7]
-                if is_up:
-                    pitches = list(reversed(pitches))
-                t = start
-                for p in pitches:
-                    dt = rng.uniform(0.004, 0.010)
-                    inst_mute.notes.append(pretty_midi.Note(
-                        velocity=int(gv),
-                        pitch=int(np.clip(p, 0, 127)),
-                        start=float(t),
-                        end=float(end),
-                    ))
-                    t += dt
-                continue
-
-            # normal strum end time
-            dur = (step_div * 0.85) * step_dur
-            end = start + dur + overlap_ms * 1e-3
-
-            # velocity humanize + down/up dynamics
-            v = int(velocity + rng.integers(-vel_rand, vel_rand + 1))
-            if hs == 0:
-                v += 10  # beat1 강조
-            v = int(np.clip(v, 40, 124))
-
-            if is_up:
-                v = int(v * 0.78)   # upstroke 약하게
-                direction = "up"
+            # ✅ hit마다 chord_tones variant 섞기
+            if voicing_variant_mix:
+                if rng.random() < float(triad_bias):
+                    variant = "triad"
+                else:
+                    variant = variants[rng.integers(0, len(variants))]
             else:
-                direction = "down"
+                variant = "triad"
 
-            # money boost: 코러스에서 가끔 1을 3으로 승격(색채)
-            vid = int(ch)
-            if money_boost and vid == 1 and rng.random() < money_boost_prob:
-                vid = 3
+            chord_tones = pick_chord_tones_variant(root, variant)
 
-            pitches = voicing_pitches(root_pc, quality, vid)
+            pattern = voicing_set[i_hit % len(voicing_set)]
+            pick_seq = apply_voicing_pattern(chord_tones, pattern)
 
-            # voicing별 강도(기타스럽게)
-            strength = 1.00
-            if vid == 2: strength = 0.88
-            if vid == 3: strength = 0.80
-            if vid == 4: strength = 1.06
+            # sustain는 악센트가 아니라 '끊김 방지/기타 공명' 수준에서만 살짝 랜덤
+            sustain_steps = rng.uniform(2.6, 3.4)  # 16분 기준 대략 2~3.5 step
+            end = t0 + step_dur * sustain_steps
 
-            add_strum(inst_clean, pitches, start, end, v, direction=direction, strength=strength)
+            # pick_seq는 한 줄씩(아르페지오). 작은 스프레드만.
+            spread = rng.uniform(0.010, 0.020)
+            delays = np.linspace(0.0, spread, num=max(1, len(pick_seq)), endpoint=True)
 
-    pm.instruments.append(inst_clean)
+            for pch, dly in zip(pick_seq, delays):
+                add_note(inst, int(pch), t0 + float(dly), end, velocity)
+
+        add_hendrix_spice(root, bar_start)
+
+    pm.instruments.append(inst)
     pm.instruments.append(inst_mute)
     pm.write(out_path)
     print("Saved MIDI:", out_path)
